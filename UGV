@@ -5,7 +5,6 @@ robot = Robot()
 timestep = int(robot.getBasicTimeStep())
 
 # ------------------- 1. 硬件初始化 -------------------
-# 四个轮子
 fl = robot.getDevice("front left wheel")
 fr = robot.getDevice("front right wheel")
 bl = robot.getDevice("back left wheel")
@@ -15,144 +14,100 @@ for w in wheels:
     w.setPosition(float('inf'))
     w.setVelocity(0.0)
 
-# GPS
 gps = robot.getDevice("gps")
 gps.enable(timestep)
-
-# 激光雷达
 lidar = robot.getDevice("lidar")
 lidar.enable(timestep)
-
-# 【新增】罗盘 (Compass) - 用于获取小车朝向
-# 注意：如果你的Pioneer3At模型里没有compass，需要在Webots场景树里添加一个
 compass = robot.getDevice("compass")
 compass.enable(timestep)
 
-# ------------------- 2. 核心参数与目标设定 -------------------
-# 目标点设定 (请根据你的Webots场景地图修改这里的坐标)
-TARGET_X = 5.0  
-TARGET_Y = 5.0
-
-# 控制参数
-BASE_SPEED = 3.0       # 基础速度
-OBSTACLE_THRESHOLD = 0.8 # 障碍物安全距离
-ARRIVAL_THRESHOLD = 0.2  # 到达目标点的判定距离
+# ------------------- 2. 参数 -------------------
+TARGET_X = 5.0
+TARGET_Z = 5.0
+BASE_SPEED = 2.5
+OBSTACLE_THRESHOLD = 0.7
+ARRIVAL_THRESHOLD = 0.15
+DEAD_ZONE = 0.08
+KP_TURN = 1.8
+MAX_TURN = 1.2
 
 # ------------------- 3. 工具函数 -------------------
-def get_bearing(compass_values):
-    """
-    将罗盘的3D向量转换为 -PI 到 PI 的航向角 (Yaw)
-    0 弧度表示向东，PI/2 表示向北 (取决于Webots世界坐标系设定)
-    """
-    rad = math.atan2(compass_values[0], compass_values[1])
-    # 注意：不同模型坐标系可能不同，如果方向反了，这里需要调整
-    return rad
-
 def normalize_angle(angle):
-    """将角度归一化到 [-pi, pi]"""
-    while angle > math.pi:
-        angle -= 2.0 * math.pi
-    while angle < -math.pi:
-        angle += 2.0 * math.pi
-    return angle
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+def get_robot_heading(compass_values):
+    cx, cz = compass_values[0], compass_values[2]
+    heading = math.atan2(cx, cz)
+    return normalize_angle(heading)
 
 def get_lidar_sectors(lidar_ranges):
-    """
-   【关键改进】将雷达数据分为5个扇形区域，寻找每个区域的最小距离
-    这样比只看3个点更安全
-    """
     n = len(lidar_ranges)
     if n == 0:
-        return [100] * 5
-    
-    # 定义区域宽度 (索引)
-    sector_width = n // 10 
-    
-    # 5个区域: 左, 左前, 前, 右前, 右
-    # 注意：雷达索引0通常对应正后方还是正前方取决于具体模型，这里假设正中间是前方
+        return [100]*5
     mid = n // 2
-    
-    # 提取各区域数据 (过滤掉0.3m以内的自身噪声)
-    left = min([x for x in lidar_ranges[0 : sector_width*2] if x > 0.3], default=100)
-    left_front = min([x for x in lidar_ranges[mid - sector_width*3 : mid - sector_width] if x > 0.3], default=100)
-    front = min([x for x in lidar_ranges[mid - sector_width : mid + sector_width] if x > 0.3], default=100)
-    right_front = min([x for x in lidar_ranges[mid + sector_width : mid + sector_width*3] if x > 0.3], default=100)
-    right = min([x for x in lidar_ranges[-sector_width*2 :] if x > 0.3], default=100)
-    
-    return [left, left_front, front, right_front, right]
+    w = n // 10
+    left = min([x for x in lidar_ranges[:w*2] if x>0.3], default=100)
+    lf = min([x for x in lidar_ranges[mid-w*3:mid-w] if x>0.3], default=100)
+    front = min([x for x in lidar_ranges[mid-w:mid+w] if x>0.3], default=100)
+    rf = min([x for x in lidar_ranges[mid+w:mid+w*3] if x>0.3], default=100)
+    right = min([x for x in lidar_ranges[-w*2:] if x>0.3], default=100)
+    return [left, lf, front, rf, right]
 
 # ------------------- 4. 主循环 -------------------
 while robot.step(timestep) != -1:
-    # 1. 获取传感器数据
-    x, y, _ = gps.getValues()
+    x, _, z = gps.getValues()
     compass_vals = compass.getValues()
     lidar_ranges = lidar.getRangeImage()
-    
-    # 2. 计算是否到达目标
-    dist_to_target = math.sqrt((x - TARGET_X)**2 + (y - TARGET_Y)**2)
-    
-    if dist_to_target < ARRIVAL_THRESHOLD:
-        print("✅ 到达目标点！")
-        for w in wheels:
-            w.setVelocity(0.0)
-        break # 停止程序
-    
-    # 3. 计算朝向目标的角度 (Navigation)
-    # 计算目标相对于当前位置的方向
-    angle_to_target = math.atan2(TARGET_X - x, TARGET_Y - y)
-    # 获取小车当前朝向
-    robot_heading = get_bearing(compass_vals)
-    # 计算角度差：小车需要转多少度才能正对目标
-    heading_error = normalize_angle(angle_to_target - robot_heading)
-    
-    # 4. 雷达障碍物分析
-    sectors = get_lidar_sectors(lidar_ranges)
-    left_dist, left_front_dist, front_dist, right_front_dist, right_dist = sectors
-    
-    print(f"GPS: {x:.1f}, {y:.1f} | 距目标: {dist_to_target:.1f}m | 角度差: {math.degrees(heading_error):.0f}°")
-    print(f"障碍: [左:{left_dist:.1f} 左前:{left_front_dist:.1f} 前:{front_dist:.1f} 右前:{right_front_dist:.1f} 右:{right_dist:.1f}]")
 
-    # ------------------- 5. 混合控制逻辑 (状态机) -------------------
+    dx = TARGET_X - x
+    dz = TARGET_Z - z
+    dist = math.sqrt(dx**2 + dz**2)
+
+    if dist < ARRIVAL_THRESHOLD:
+        print("✅ 成功到达目标点！")
+        for w in wheels:
+            w.setVelocity(0)
+        break
+
+    # ====================== 【核心修复】角度公式反过来 ======================
+    target_angle = math.atan2(dz, dx)
+    robot_angle = get_robot_heading(compass_vals)
+    error = normalize_angle(target_angle - robot_angle)
+    # ======================================================================
+
+    left_d, lf_d, front_d, rf_d, right_d = get_lidar_sectors(lidar_ranges)
+
+    print(f"位置 X:{x:.1f} Z:{z:.1f} | 距离:{dist:.1f}m | 角度误差:{math.degrees(error):.0f}°")
+
     left_speed = BASE_SPEED
     right_speed = BASE_SPEED
-    
-    # 优先级 1: 前方紧急避障
-    if front_dist < OBSTACLE_THRESHOLD:
-        print("⚠️ 前方受阻！紧急转向")
-        # 哪边空就往哪转
-        if left_front_dist > right_front_dist:
-            left_speed = -BASE_SPEED * 0.3  # 原地左转
-            right_speed = BASE_SPEED * 0.3
-        else:
-            left_speed = BASE_SPEED * 0.3
-            right_speed = -BASE_SPEED * 0.3
-            
-    # 优先级 2: 侧面避障 (如果侧面太近，稍微远离)
-    elif left_front_dist < OBSTACLE_THRESHOLD * 0.8:
-        print("↪️ 左侧过近，向右微调")
-        left_speed = BASE_SPEED
-        right_speed = BASE_SPEED * 0.6
-    elif right_front_dist < OBSTACLE_THRESHOLD * 0.8:
-        print("↩️ 右侧过近，向左微调")
-        left_speed = BASE_SPEED * 0.6
-        right_speed = BASE_SPEED
-        
-    # 优先级 3: 正常朝向目标行驶 (比例控制)
-    else:
-        # 利用 heading_error 控制转向
-        # 误差为正，目标在左边，左转 (左轮慢，右轮快)
-        # 系数 2.0 是转向灵敏度，可根据实际效果调整
-        turn_rate = heading_error * 2.0
-        
-        left_speed = BASE_SPEED - turn_rate
-        right_speed = BASE_SPEED + turn_rate
-        
-        # 限制最大速度
-        max_speed = 5.0
-        left_speed = max(-max_speed, min(max_speed, left_speed))
-        right_speed = max(-max_speed, min(max_speed, right_speed))
 
-    # 执行速度命令
+    if front_d < OBSTACLE_THRESHOLD:
+        print("⚠️ 前方障碍，绕行")
+        if lf_d > rf_d:
+            left_speed = -0.4
+            right_speed = 1.2
+        else:
+            left_speed = 1.2
+            right_speed = -0.4
+    elif lf_d < OBSTACLE_THRESHOLD * 0.75:
+        left_speed = BASE_SPEED
+        right_speed = BASE_SPEED * 0.5
+    elif rf_d < OBSTACLE_THRESHOLD * 0.75:
+        left_speed = BASE_SPEED * 0.5
+        right_speed = BASE_SPEED
+    else:
+        if abs(error) < DEAD_ZONE:
+            turn = 0
+        else:
+            turn = error * KP_TURN
+        turn = max(-MAX_TURN, min(MAX_TURN, turn))
+        left_speed = BASE_SPEED - turn
+        right_speed = BASE_SPEED + turn
+
+    left_speed = max(-6, min(6, left_speed))
+    right_speed = max(-6, min(6, right_speed))
+
     fl.setVelocity(left_speed)
     bl.setVelocity(left_speed)
     fr.setVelocity(right_speed)
